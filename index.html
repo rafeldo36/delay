@@ -98,6 +98,7 @@ input[type=range]{width:100%;accent-color:var(--accent)}
 .tap{display:flex;gap:10px;align-items:center}
 .tapbtn{width:76px;height:76px;border-radius:50%;background:var(--panel-2);border:2px solid var(--knob-edge);font:700 13px var(--f-display);text-transform:uppercase;letter-spacing:.08em}
 .tapbtn:active{background:var(--accent);color:var(--accent-ink);border-color:var(--accent)}
+.num{width:110px;background:var(--panel-2);border:1px solid var(--line);border-radius:7px;padding:8px 10px;color:var(--ink);font-size:14px}
 .sep{height:1px;background:var(--line);border:0;margin:0}
 .timeline{display:grid;gap:6px}
 @media (max-width:520px){.knobs{gap:14px}.knob{width:78px}}
@@ -108,7 +109,7 @@ input[type=range]{width:100%;accent-color:var(--accent)}
 <div class="wrap">
   <header class="top">
     <h1>Delay Lab</h1>
-    <p>DD-3 digital delay (up to 2000 ms) and a tempo-synced ping pong delay for your own audio. Play through a mic live, load a file, or record a take and process it afterwards.</p>
+    <p>DD-3 digital delay (up to 2000 ms) and ping pong delay for your own audio. Play through a mic live, load a file, or record a take and process it afterwards.</p>
   </header>
 
   <section class="card" aria-labelledby="h-src">
@@ -187,27 +188,6 @@ input[type=range]{width:100%;accent-color:var(--accent)}
  * ------------------------------------------------------------------ */
 //<worklet>
 function workletMain(){
-  // Ducking: input 0 is the wet signal, input 1 is the dry signal that pushes it down.
-  class DuckProc extends AudioWorkletProcessor{
-    static get parameterDescriptors(){return [
-      {name:'amount',defaultValue:0.7,minValue:0,maxValue:1,automationRate:'k-rate'},
-      {name:'release',defaultValue:0.3,minValue:0.02,maxValue:2,automationRate:'k-rate'}];}
-    constructor(){super();this.env=0;}
-    process(inputs,outputs,params){
-      const wet=inputs[0]||[],side=inputs[1]||[],out=outputs[0];
-      const n=out[0].length,amt=params.amount[0],rel=params.release[0];
-      const aC=Math.exp(-1/(sampleRate*0.004)),rC=Math.exp(-1/(sampleRate*rel));
-      for(let i=0;i<n;i++){
-        let s=0;
-        for(let c=0;c<side.length;c++){const v=Math.abs(side[c][i]);if(v>s)s=v;}
-        const k=s>this.env?aC:rC;
-        this.env=k*this.env+(1-k)*s;
-        const g=1-amt*Math.min(1,this.env/0.08);
-        for(let c=0;c<out.length;c++){out[c][i]=(wet[c]?wet[c][i]:0)*g;}
-      }
-      return true;
-    }
-  }
   // Mono dry-take recorder.
   class RecProc extends AudioWorkletProcessor{
     constructor(){
@@ -240,7 +220,6 @@ function workletMain(){
       return true;
     }
   }
-  registerProcessor('duck',DuckProc);
   registerProcessor('recorder',RecProc);
 }
 //</worklet>
@@ -253,18 +232,16 @@ const fmtClock=(s)=>{s=Math.max(0,s|0);return Math.floor(s/60)+':'+String(s%60).
 
 /* ------------------------------ state ------------------------------ */
 const RANGES=[[12.5,50],[50,200],[200,2000]];
-const SYNC={'free':0,'1/4':1,'1/8.':0.75,'1/8':0.5,'1/8T':1/3,'1/16':0.25};
 const state={
   source:'mic',effect:'dd3',bypass:false,master:0.8,input:0.5,
   params:{
     dd3:{range:1,time:.5,fb:.35,level:.5,hold:false},
-    pp:{time:.45,fb:.45,level:.5,tone:.8,spread:1,mod:.2,duck:.3,sync:'free',bpm:120,start:'L',hold:false}
+    pp:{time:.45,fb:.45,level:.5,tone:.8,spread:1}
   }
 };
 function msToTime(ms){return clamp(Math.log(clamp(ms,20,2500)/20)/Math.log(125),0,1);}
 function timeMs(eff,p){
   if(eff==='dd3'){const [a,b]=RANGES[p.range];return a*Math.pow(b/a,p.time);}
-  if(p.sync&&p.sync!=='free')return clamp(60000/p.bpm*SYNC[p.sync],20,2950);
   return 20*Math.pow(2500/20,p.time);
 }
 function setTimeFromMs(eff,p,ms){
@@ -276,9 +253,6 @@ function setTimeFromMs(eff,p,ms){
   p.time=clamp(p.time,0,1);
 }
 const toneHz=(t)=>500*Math.pow(18000/500,t);
-// Soft clipper with unity small-signal gain, so it warms repeats without ever adding loop gain.
-function softCurve(){const n=1024,k=1.2,c=new Float32Array(n);for(let i=0;i<n;i++){const x=i/(n-1)*2-1;c[i]=Math.tanh(k*x)/k;}return c;}
-
 /* ------------------------------ audio ------------------------------ */
 let ctx=null,workletURL=null,inBus,inAn,outBus,outAn,monitorG,micGate,recNode,engine=null;
 let micStream=null,micNode=null;
@@ -350,48 +324,27 @@ class Engine{
       this.set(fb.gain,hold?1:p.fb*0.98,0.02);
     };
   }
-  // Ping pong: input -> L delay -> R delay -> feedback. Every repeat passes a
-  // highpass, tone lowpass and soft clipper, so repeats get darker and warmer.
-  // Slow modulation on both delays, optional ducking by the dry signal.
   buildPingPong(){
     const c=this.c,mk=this.mk;
     const mono=mk(c.createGain());
     mono.channelCount=1;mono.channelCountMode='explicit';mono.channelInterpretation='speakers';
-    const send=mk(c.createGain());
-    const dL=mk(c.createDelay(3)),dR=mk(c.createDelay(3)),fb=mk(c.createGain());
-    const chain=()=>{
-      const hp=mk(c.createBiquadFilter()),lp=mk(c.createBiquadFilter()),sat=mk(c.createWaveShaper());
-      hp.type='highpass';hp.frequency.value=110;hp.Q.value=0.707;
-      lp.type='lowpass';lp.Q.value=0.707;
-      sat.curve=softCurve();sat.oversample='2x';
-      hp.connect(lp);lp.connect(sat);
-      return {inp:hp,lp,out:sat};
-    };
-    const A=chain(),B=chain();
-    this.input.connect(mono);mono.connect(send);send.connect(dL);
-    dL.connect(A.inp);A.out.connect(dR);dR.connect(B.inp);B.out.connect(fb);fb.connect(dL);
-    const g1=mk(c.createGain()),g2=mk(c.createGain()),g3=mk(c.createGain()),g4=mk(c.createGain());
+    const dL=mk(c.createDelay(3)),dR=mk(c.createDelay(3)),lp=mk(c.createBiquadFilter()),fb=mk(c.createGain());
+    lp.type='lowpass';
+    const gLL=mk(c.createGain()),gLR=mk(c.createGain()),gRR=mk(c.createGain()),gRL=mk(c.createGain());
     const merger=mk(c.createChannelMerger(2));
-    A.out.connect(g1);g1.connect(merger,0,0);A.out.connect(g2);g2.connect(merger,0,1);
-    B.out.connect(g3);g3.connect(merger,0,0);B.out.connect(g4);g4.connect(merger,0,1);
-    const duck=mk(node(c,'duck',{numberOfInputs:2}));
-    merger.connect(duck,0,0);this.input.connect(duck,0,1);duck.connect(this.wet);
-    const lfoL=this.lfo(dL.delayTime,0.31),lfoR=this.lfo(dR.delayTime,0.43);
+    this.input.connect(mono);mono.connect(dL);dL.connect(dR);dR.connect(lp);lp.connect(fb);fb.connect(dL);
+    dL.connect(gLL);gLL.connect(merger,0,0);dL.connect(gLR);gLR.connect(merger,0,1);
+    lp.connect(gRR);gRR.connect(merger,0,1);lp.connect(gRL);gRL.connect(merger,0,0);
+    merger.connect(this.wet);
+    const eff=this.eff;
     return (p)=>{
-      const t=timeMs('pp',p)/1000;
+      const t=timeMs(eff,p)/1000;
       this.set(dL.delayTime,t,0.03);this.set(dR.delayTime,t,0.03);
-      const hold=!!p.hold;
-      this.set(send.gain,hold?0:1,0.015);
-      this.set(fb.gain,hold?1:p.fb*0.97,0.02);
-      const hz=clamp(toneHz(p.tone),200,20000);
-      this.set(A.lp.frequency,hz,0.03);this.set(B.lp.frequency,hz,0.03);
-      const d=Math.min(p.mod*0.003,t*0.4);
-      this.set(lfoL.gain,d,0.05);this.set(lfoR.gain,d,0.05);
-      const cross=1-p.spread,norm=1/(1+0.5*cross),side=p.start==='R';
-      this.set(g1.gain,(side?cross:1)*norm,0.03);this.set(g2.gain,(side?1:cross)*norm,0.03);
-      this.set(g3.gain,(side?1:cross)*norm,0.03);this.set(g4.gain,(side?cross:1)*norm,0.03);
-      this.set(duck.parameters.get('amount'),p.duck,0.05);
-      this.set(duck.parameters.get('release'),0.3,0.05);
+      this.set(fb.gain,p.fb*0.98,0.02);
+      this.set(lp.frequency,toneHz(p.tone===undefined?0.8:p.tone),0.03);
+      const spread=p.spread===undefined?1:p.spread,cross=1-spread,norm=1/(1+0.5*cross);
+      this.set(gLL.gain,norm,0.03);this.set(gRR.gain,norm,0.03);
+      this.set(gLR.gain,cross*norm,0.03);this.set(gRL.gain,cross*norm,0.03);
     };
   }
   fadeOut(){this.masterG.gain.setTargetAtTime(0,this.c.currentTime,0.01);}
@@ -502,25 +455,10 @@ function makeKnob({label,value,def,fmt,onInput}){
 /* ----------------------------- effect UI ----------------------------- */
 const DESC={
   dd3:'Clean digital delay. Range 1 gives slapback and doubling, range 3 gives long repeats up to 2000 ms.',
-  pp:'Repeats bounce between left and right, getting darker each time. Lock it to a tempo with the note buttons. Needs headphones or stereo speakers.'
+  pp:'Repeats bounce between left and right. Needs headphones or stereo speakers to hear the movement.'
 };
 const NAMES={dd3:'DD-3 style digital delay',pp:'Ping pong delay'};
 let taps=[];
-function holdButton(p,onChange){
-  const hold=document.createElement('button');hold.className='btn';hold.textContent='Hold';hold.setAttribute('aria-pressed',String(p.hold));
-  hold.title='Freeze what is in the delay loop and loop it';
-  hold.onclick=()=>{p.hold=!p.hold;hold.setAttribute('aria-pressed',String(p.hold));hold.style.background=p.hold?'var(--accent)':'';hold.style.color=p.hold?'var(--accent-ink)':'';onChange();};
-  return hold;
-}
-function segment(label,items,get,set){
-  const seg=document.createElement('div');seg.className='seg';seg.setAttribute('role','group');seg.setAttribute('aria-label',label);
-  const paint=()=>seg.querySelectorAll('button').forEach((x,j)=>x.setAttribute('aria-pressed',String(items[j][0]===get())));
-  items.forEach(([key,text])=>{
-    const bt=document.createElement('button');bt.textContent=text;
-    bt.onclick=()=>{set(key);paint();};seg.appendChild(bt);
-  });
-  paint();seg.paint=paint;return seg;
-}
 function renderEffect(){
   const eff=state.effect,p=state.params[eff],box=$('#fx');
   box.replaceChildren();
@@ -535,66 +473,72 @@ function renderEffect(){
   byp.onclick=()=>{state.bypass=!state.bypass;byp.setAttribute('aria-pressed',String(!state.bypass));bl.textContent=state.bypass?'Effect off':'Effect on';applyEngine();};
   head.appendChild(byp);box.appendChild(head);
 
-  let timeKnob=null,bpmKnob=null,syncSeg=null;
-  const dim=()=>{
-    if(eff!=='pp')return;
-    const free=p.sync==='free';
-    if(timeKnob)timeKnob.style.opacity=free?'':'.45';
-    if(bpmKnob)bpmKnob.style.opacity=free?'.45':'';
-  };
-  // While a note value is active, keep the stored time knob position in step with the synced time.
-  const mirror=()=>{if(eff==='pp'&&p.sync!=='free')p.time=msToTime(timeMs('pp',p));if(timeKnob)timeKnob.setValue(p.time);};
-
+  let timeKnob=null,rangeSeg=null;
+  const lim=eff==='dd3'?[12.5,2000]:[20,2500];
   const row=document.createElement('div');row.className='row';
+
+  // typed delay time
+  const field=document.createElement('label');field.className='check';
+  field.innerHTML='<span class="note">Time (ms)</span><input type="number" class="num mono" inputmode="decimal" step="0.1" aria-label="Delay time in milliseconds">';
+  const inp=$('input',field);inp.min=String(lim[0]);inp.max=String(lim[1]);
+  const fmtVal=(ms)=>String(+ms.toFixed(1));
+  const showTime=()=>{if(document.activeElement!==inp)inp.value=fmtVal(timeMs(eff,p));};
+  const afterChange=()=>{if(timeKnob)timeKnob.setValue(p.time);if(rangeSeg)rangeSeg.paint();showTime();applyEngine();};
+  const commit=()=>{
+    const v=parseFloat(inp.value.replace(',','.'));
+    if(!isFinite(v)){inp.value=fmtVal(timeMs(eff,p));return;}
+    const ms=clamp(v,lim[0],lim[1]);
+    setTimeFromMs(eff,p,ms);
+    inp.value=fmtVal(ms);
+    if(timeKnob)timeKnob.setValue(p.time);if(rangeSeg)rangeSeg.paint();applyEngine();
+  };
+  inp.addEventListener('change',commit);
+  inp.addEventListener('keydown',(e)=>{if(e.key==='Enter'){e.preventDefault();commit();inp.blur();}});
+  inp.addEventListener('focus',()=>inp.select());
+
   if(eff==='dd3'){
-    const seg=segment('Delay range',RANGES.map(([a,b],i)=>[i,a+'–'+b+' ms']),()=>p.range,(i)=>{p.range=i;applyEngine();if(timeKnob)timeKnob.refresh();});
-    row.appendChild(seg);
-    row.appendChild(holdButton(p,applyEngine));
-  }else{
-    syncSeg=segment('Note value',Object.keys(SYNC).map(k=>[k,k==='free'?'Free':k]),()=>p.sync,(k)=>{p.sync=k;mirror();applyEngine();dim();});
-    row.appendChild(syncSeg);
-    row.appendChild(segment('First repeat side',[['L','L first'],['R','R first']],()=>p.start,(k)=>{p.start=k;applyEngine();}));
-    row.appendChild(holdButton(p,applyEngine));
+    const seg=document.createElement('div');seg.className='seg';seg.setAttribute('role','group');seg.setAttribute('aria-label','Delay range');
+    RANGES.forEach(([a,b],i)=>{
+      const bt=document.createElement('button');bt.textContent=a+'–'+b+' ms';
+      bt.onclick=()=>{p.range=i;if(timeKnob)timeKnob.refresh();seg.paint();showTime();applyEngine();};
+      seg.appendChild(bt);
+    });
+    seg.paint=()=>seg.querySelectorAll('button').forEach((x,j)=>x.setAttribute('aria-pressed',String(p.range===j)));
+    seg.paint();rangeSeg=seg;row.appendChild(seg);
+    const hold=document.createElement('button');hold.className='btn';hold.textContent='Hold';hold.setAttribute('aria-pressed',String(p.hold));
+    hold.title='Freeze what is in the delay loop and loop it';
+    hold.onclick=()=>{p.hold=!p.hold;hold.setAttribute('aria-pressed',String(p.hold));hold.style.background=p.hold?'var(--accent)':'';hold.style.color=p.hold?'var(--accent-ink)':'';applyEngine();};
+    row.appendChild(hold);
   }
+  row.appendChild(field);
   box.appendChild(row);
 
   const knobs=document.createElement('div');knobs.className='knobs';
   const K=(o)=>{const k=makeKnob(o);knobs.appendChild(k);return k;};
-  const pct=(v)=>Math.round(v*100)+'%';
-  K({label:'E.Level',value:p.level,def:.5,fmt:pct,onInput:(v)=>{p.level=v;applyEngine();}});
-  K({label:'F.Back',value:p.fb,def:eff==='pp'?.45:.35,fmt:pct,onInput:(v)=>{p.fb=v;applyEngine();}});
-  timeKnob=K({label:'D.Time',value:p.time,def:.5,fmt:()=>fmtMs(timeMs(eff,p)),onInput:(v)=>{
-    if(eff==='pp'&&p.sync!=='free'){p.sync='free';if(syncSeg)syncSeg.paint();dim();}
-    p.time=v;applyEngine();
-  }});
+  K({label:'E.Level',value:p.level,def:.5,fmt:(v)=>Math.round(v*100)+'%',onInput:(v)=>{p.level=v;applyEngine();}});
+  K({label:'F.Back',value:p.fb,def:.35,fmt:(v)=>Math.round(v*100)+'%',onInput:(v)=>{p.fb=v;applyEngine();}});
+  timeKnob=K({label:'D.Time',value:p.time,def:.5,fmt:()=>fmtMs(timeMs(eff,p)),onInput:(v)=>{p.time=v;showTime();applyEngine();}});
   if(eff==='pp'){
-    K({label:'Tone',value:p.tone,def:.8,fmt:(v)=>Math.round(toneHz(v))+' Hz',onInput:(v)=>{p.tone=v;applyEngine();}});
-    K({label:'Spread',value:p.spread,def:1,fmt:pct,onInput:(v)=>{p.spread=v;applyEngine();}});
-    K({label:'Mod',value:p.mod,def:.2,fmt:pct,onInput:(v)=>{p.mod=v;applyEngine();}});
-    K({label:'Duck',value:p.duck,def:.3,fmt:pct,onInput:(v)=>{p.duck=v;applyEngine();}});
-    bpmKnob=K({label:'Tempo',value:(p.bpm-40)/200,def:80/200,fmt:(v)=>Math.round(40+200*v)+' BPM',onInput:(v)=>{
-      p.bpm=Math.round(40+200*v);mirror();applyEngine();
-    }});
+    K({label:'Tone',value:p.tone,def:.7,fmt:(v)=>Math.round(toneHz(v))+' Hz',onInput:(v)=>{p.tone=v;applyEngine();}});
+    K({label:'Spread',value:p.spread,def:1,fmt:(v)=>Math.round(v*100)+'%',onInput:(v)=>{p.spread=v;applyEngine();}});
   }
   box.appendChild(knobs);
-  dim();
+  showTime();
 
   if(eff==='pp'){
     const tap=document.createElement('div');tap.className='tap';
-    tap.innerHTML='<button class="tapbtn">Tap</button><div><div class="mono" id="tap-read">Tap twice or more</div><div class="note">Tap a quarter note. With a note value chosen the delay follows the tempo, with Free it uses the tap time directly. A gap over 2 s starts over.</div></div>';
+    tap.innerHTML='<button class="tapbtn">Tap</button><div><div class="mono" id="tap-read">Tap twice or more</div><div class="note">Tap to the beat. A gap over 2 s starts over.</div></div>';
     $('.tapbtn',tap).addEventListener('pointerdown',(e)=>{
       e.preventDefault();
       const now=performance.now();
       if(taps.length&&now-taps[taps.length-1]>2000)taps=[];
-      taps.push(now);taps=taps.slice(-6);
+      taps.push(now);taps=taps.slice(-5);
       if(taps.length>=2){
         const gaps=[];for(let i=1;i<taps.length;i++)gaps.push(taps[i]-taps[i-1]);
         const ms=gaps.reduce((a,b)=>a+b,0)/gaps.length;
-        p.bpm=clamp(Math.round(60000/ms),40,240);
-        if(p.sync==='free')setTimeFromMs('pp',p,ms);else p.time=msToTime(timeMs('pp',p));
-        timeKnob.setValue(p.time);bpmKnob.setValue((p.bpm-40)/200);
-        applyEngine();
-        $('#tap-read',tap).textContent=p.bpm+' BPM · '+fmtMs(timeMs('pp',p));
+        setTimeFromMs(eff,p,ms);
+        afterChange();
+        $('#tap-read',tap).textContent=Math.round(60000/ms)+' BPM · '+fmtMs(timeMs(eff,p));
       }
     });
     box.appendChild(tap);
@@ -773,11 +717,11 @@ setInterval(()=>{if(buffer)updateClock();},200);
 function tailSeconds(){
   const p=state.params[state.effect];
   const t=timeMs(state.effect,p)/1000;
-  const fb=clamp((p.fb||0)*0.97,0.05,0.97);
+  const fb=clamp((p.fb||0)*0.98,0.05,0.97);
   let reps=Math.ceil(Math.log(0.001)/Math.log(fb));
   if(p.hold)reps=1;
-  const legs=state.effect==='pp'?2:1;
-  return clamp(t*(reps*legs+1),1.5,30);
+  const mult=state.effect==='pp'?1.5:1;
+  return clamp(t*(reps+1)*mult,1.5,20);
 }
 function encodeWav(buf){
   const ch=buf.numberOfChannels,len=buf.length,sr=buf.sampleRate;
